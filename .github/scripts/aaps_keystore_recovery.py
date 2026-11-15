@@ -21,6 +21,10 @@ MAGIC = b"AAPS-RECOVERY-1\x00"
 FILES = ("keystore.jks", "keyStoreInfo.txt")
 
 
+class RecoveryError(Exception):
+    """A fixed diagnostic message safe for public logs."""
+
+
 def key(password, salt):
     return Scrypt(salt=salt, length=32, n=2**17, r=8, p=1).derive(password.encode("utf-8"))
 
@@ -33,7 +37,7 @@ def encrypt(payload, password):
 
 def decrypt(archive, password):
     if not archive.startswith(MAGIC) or len(archive) < len(MAGIC) + 44:
-        raise ValueError("Invalid archive format")
+        raise RecoveryError("Invalid archive format")
     start = len(MAGIC)
     salt, nonce = archive[start:start + 16], archive[start + 16:start + 28]
     header = archive[:start + 28]
@@ -51,7 +55,7 @@ def zip_payload(store, info):
 def parse_bundle(encoded, size):
     fields = base64.b64decode("".join(encoded.split()), validate=True).decode("utf-8").split("|")
     if len(fields) != size or any(not field or "\n" in field or "\r" in field for field in fields):
-        raise ValueError("Invalid secret bundle format")
+        raise RecoveryError("Invalid secret bundle format")
     return fields
 
 
@@ -64,7 +68,7 @@ def original_key():
             os.environ[name] for name in ("KEYSTORE_BASE64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD")
         )
     if not all((data, storepass, alias, keypass)):
-        raise ValueError("Signing secret is incomplete")
+        raise RecoveryError("Signing secret is incomplete")
     return base64.b64decode("".join(data.split()), validate=True), storepass, alias, keypass
 
 
@@ -82,7 +86,7 @@ def validate_key(keystore, storepass, alias, keypass):
             result = subprocess.run(["keytool", *args, *common], env=env,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode:
-                raise ValueError("The stored key, alias or passwords did not validate")
+                raise RecoveryError("The stored key, alias or passwords did not validate")
         return hashlib.sha256(cert.read_bytes()).hexdigest()
 
 
@@ -92,10 +96,12 @@ def json_request(url, data=None, headers=None):
 
 
 def upload_private_drive(archive, name):
+    print("Checking Google Drive authorization.", flush=True)
     client_id, refresh_token = parse_bundle(os.environ["GDRIVE_OAUTH2"], 2)
     auth = json_request("https://oauth2.googleapis.com/token", urlencode({
         "client_id": client_id, "refresh_token": refresh_token, "grant_type": "refresh_token",
     }).encode())
+    print("Drive authorization accepted; uploading ciphertext.", flush=True)
     boundary = os.urandom(24).hex().encode()
     body = (
         b"--" + boundary + b"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
@@ -103,23 +109,30 @@ def upload_private_drive(archive, name):
         + b"\r\n--" + boundary + b"\r\nContent-Type: application/octet-stream\r\n\r\n"
         + archive + b"\r\n--" + boundary + b"--\r\n"
     )
-    fields = urlencode({"uploadType": "multipart", "fields": "name,shared,permissions(type,role)"})
+    fields = urlencode({"uploadType": "multipart", "fields": "id"})
     result = json_request("https://www.googleapis.com/upload/drive/v3/files?" + fields, body, {
         "Authorization": "Bearer " + auth["access_token"],
         "Content-Type": "multipart/related; boundary=" + boundary.decode(),
     })
+    fields = urlencode({"fields": "name,shared,permissions(type,role)"})
+    result = json_request(f"https://www.googleapis.com/drive/v3/files/{result['id']}?{fields}", headers={
+        "Authorization": "Bearer " + auth["access_token"],
+    })
     if result.get("name") != name or result.get("shared") is not False or [
         (p.get("type"), p.get("role")) for p in result.get("permissions", [])
     ] != [("user", "owner")]:
-        raise ValueError("Drive did not confirm owner-only access to the encrypted file")
+        raise RecoveryError("Drive did not confirm owner-only access to the encrypted file")
 
 
 def export():
     password = os.environ["AAPS_RECOVERY_PASSWORD"]
     if len(password) < 24:
-        raise ValueError("Recovery password must contain at least 24 characters")
+        raise RecoveryError("Recovery password must contain at least 24 characters")
+    print("Recovery password length accepted; reading signing configuration.", flush=True)
     store, storepass, alias, keypass = original_key()
+    print("Signing configuration decoded; validating the original key.", flush=True)
     fingerprint = validate_key(store, storepass, alias, keypass)
+    print("Original signing key validated.", flush=True)
     info = f"ALIAS={alias}\nKEYSTORE_PASSWORD={storepass}\nKEY_PASSWORD={keypass}\nCERT_SHA256={fingerprint}\n"
     archive = encrypt(zip_payload(store, info), password)
     name = f"aaps-keystore-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}.aapsenc"
@@ -133,7 +146,7 @@ def unpack(source, destination):
     payload = decrypt(source.read_bytes(), password)
     with ZipFile(io.BytesIO(payload)) as archive:
         if sorted(archive.namelist()) != sorted(FILES):
-            raise ValueError("Unexpected archive contents")
+            raise RecoveryError("Unexpected archive contents")
         destination.mkdir(mode=0o700)
         for name in FILES:
             with (destination / name).open("xb") as target:
@@ -166,10 +179,12 @@ if __name__ == "__main__":
         elif len(sys.argv) == 4 and sys.argv[1] == "decrypt":
             unpack(Path(sys.argv[2]), Path(sys.argv[3]))
         else:
-            raise ValueError("Invalid command")
+            raise RecoveryError("Invalid command")
     except Exception as error:
         # Never print remote responses, credentials or exceptions that may include them.
         print(f"Keystore recovery failed ({type(error).__name__}).", file=sys.stderr)
+        if isinstance(error, RecoveryError):
+            print(error, file=sys.stderr)
         if isinstance(error, InvalidTag):
             print("The password is incorrect or the archive was modified.", file=sys.stderr)
         raise SystemExit(1) from None
